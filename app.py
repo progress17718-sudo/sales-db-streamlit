@@ -43,6 +43,23 @@ CONTACT_PATHS = [
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_REGEX = re.compile(r"(?:\+?82[-.\s]?)?0\d{1,2}[-.\s)]?\d{3,4}[-.\s]?\d{4}|\b1[568]\d{2}[-.\s]?\d{4}\b")
 CONTACT_PRIORITY_KEYWORDS = ["footer", "회사소개", "고객센터", "제휴문의", "문의", "contact", "customer", "cs", "partnership", "inquiry"]
+PHONE_EXCLUDE_CONTEXT_KEYWORDS = [
+    "팩스",
+    "fax",
+    "사업자등록번호",
+    "사업자 등록번호",
+    "사업자번호",
+    "통신판매업",
+    "통신판매",
+    "법인등록번호",
+    "계좌번호",
+    "계좌",
+    "주문번호",
+    "주문 번호",
+    "운송장",
+    "개인정보",
+]
+EMAIL_EXCLUDE_PREFIXES = ("privacy", "noreply", "no-reply", "recruit", "career", "webmaster", "admin", "security", "personal")
 ROBOTS_CACHE: dict[str, robotparser.RobotFileParser | None] = {}
 
 INDUSTRY_OPTIONS = [
@@ -505,6 +522,14 @@ class CollectionStats:
     quality_excluded_rows: list[dict[str, str]]
 
 
+@dataclass(frozen=True)
+class ContactFinding:
+    kind: str
+    value: str
+    reason: str
+    source_url: str
+
+
 def clean_text(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
@@ -796,6 +821,7 @@ def collect_brand_candidates(industry: str, target_count: int) -> tuple[pd.DataF
                     "브랜드명": result.brand_name or clean_brand_title(result.title, result.url),
                     "사이트": result.url,
                     "도메인": domain,
+                    "스니펫": result.snippet,
                     "수집출처": "SerpAPI",
                     "검색키워드": keyword,
                 }
@@ -1017,6 +1043,9 @@ def prepare_output_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     output["사이트"] = df["사이트"] if "사이트" in df else ""
     output["이메일"] = ""
     output["전화번호"] = ""
+    output["연락처 수집 상태"] = ""
+    output["연락처 수집 사유"] = ""
+    output["연락처 출처 URL"] = ""
     output["수집출처"] = df["수집출처"] if "수집출처" in df else ""
     output["수집일"] = current_collection_date()
     return output.fillna("")
@@ -1081,6 +1110,75 @@ def normalize_phone(value: str) -> str:
     return value
 
 
+def phone_context_is_excluded(text: str, start: int, end: int) -> bool:
+    context = text[max(0, start - 90) : min(len(text), end + 90)].lower()
+    return any(keyword.lower() in context for keyword in PHONE_EXCLUDE_CONTEXT_KEYWORDS)
+
+
+def extract_contacts_from_text(text: str, source_url: str, reason: str) -> list[ContactFinding]:
+    findings: list[ContactFinding] = []
+    for email in EMAIL_REGEX.findall(text):
+        email = clean_text(email)
+        if email.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")):
+            continue
+        if is_blocked_contact_email(email):
+            continue
+        findings.append(ContactFinding(kind="email", value=email, reason=reason, source_url=source_url))
+
+    for match in PHONE_REGEX.finditer(text):
+        if phone_context_is_excluded(text, match.start(), match.end()):
+            continue
+        phone = normalize_phone(match.group(0))
+        if phone:
+            findings.append(ContactFinding(kind="phone", value=phone, reason=reason, source_url=source_url))
+    return findings
+
+
+def is_blocked_contact_email(email: object) -> bool:
+    text = clean_text(email).lower()
+    if not text or "@" not in text:
+        return True
+    if any(f"{prefix}@" in text for prefix in EMAIL_EXCLUDE_PREFIXES):
+        return True
+    local_part = text.split("@", 1)[0]
+    return local_part in EMAIL_EXCLUDE_PREFIXES
+
+
+def sanitize_display_email(value: object) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    email_candidates = EMAIL_REGEX.findall(text)
+    valid_emails = dedupe_keep_order(
+        [
+            clean_text(email)
+            for email in email_candidates
+            if not is_blocked_contact_email(email)
+            and not email.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"))
+        ]
+    )
+    if len(valid_emails) == 1:
+        return valid_emails[0]
+    return ""
+
+
+def sanitize_contact_columns_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    output = df.copy()
+    if "이메일" not in output:
+        return output
+    for index, row in output.iterrows():
+        original_email = clean_text(row.get("이메일", ""))
+        safe_email = sanitize_display_email(original_email)
+        output.at[index, "이메일"] = safe_email
+        if original_email and not safe_email:
+            phone = clean_text(row.get("전화번호", ""))
+            output.at[index, "연락처 수집 상태"] = "전화번호만 수집" if phone else "연락처 없음"
+            output.at[index, "연락처 수집 사유"] = "유효한 이메일 없음"
+            if not phone:
+                output.at[index, "연락처 출처 URL"] = ""
+    return output
+
+
 def visible_text_from_soup(soup: BeautifulSoup) -> str:
     priority_chunks: list[str] = []
     footer = soup.find("footer")
@@ -1101,19 +1199,46 @@ def visible_text_from_soup(soup: BeautifulSoup) -> str:
     return f"{priority_text} {full_text}".strip()
 
 
-def extract_contacts_from_html(html: str) -> tuple[list[str], list[str]]:
+def extract_contacts_from_html(html: str, source_url: str) -> list[ContactFinding]:
     soup = BeautifulSoup(html, "html.parser")
-    candidates = [visible_text_from_soup(soup)]
+    findings: list[ContactFinding] = []
+    text_chunks: list[tuple[str, str]] = []
+    footer = soup.find("footer")
+    if footer:
+        text_chunks.append((footer.get_text(" ", strip=True), "footer에서 발견"))
+    for element in soup.find_all(["address", "section", "article", "div", "p", "li", "td", "span"]):
+        element_text = element.get_text(" ", strip=True)
+        if not element_text:
+            continue
+        element_id = " ".join(
+            [
+                clean_text(element.get("id", "")),
+                clean_text(" ".join(element.get("class", [])) if isinstance(element.get("class"), list) else element.get("class", "")),
+            ]
+        ).lower()
+        if any(keyword.lower() in element_id or keyword.lower() in element_text.lower() for keyword in CONTACT_PRIORITY_KEYWORDS):
+            text_chunks.append((element_text, "회사소개/고객센터/문의 영역에서 발견"))
+        elif EMAIL_REGEX.search(element_text) or PHONE_REGEX.search(element_text):
+            text_chunks.append((element_text, "실제 페이지 본문에서 발견"))
+
+    for text, reason in text_chunks:
+        findings.extend(extract_contacts_from_text(text, source_url, reason))
+
     for link in soup.find_all("a", href=True):
         href = clean_text(link.get("href", ""))
+        link_text = clean_text(link.get_text(" ", strip=True))
         if href.lower().startswith("mailto:"):
-            candidates.append(href.split(":", 1)[1].split("?", 1)[0])
+            email = clean_text(href.split(":", 1)[1].split("?", 1)[0])
+            if EMAIL_REGEX.fullmatch(email) and not is_blocked_contact_email(email):
+                findings.append(ContactFinding(kind="email", value=email, reason="mailto 링크에서 발견", source_url=source_url))
         elif href.lower().startswith("tel:"):
-            candidates.append(href.split(":", 1)[1])
-    text = " ".join(candidates)
-    emails = dedupe_keep_order([email for email in EMAIL_REGEX.findall(text) if not email.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"))])
-    phones = dedupe_keep_order([normalize_phone(phone) for phone in PHONE_REGEX.findall(text)])
-    return emails, phones
+            tel_text = href.split(":", 1)[1]
+            if not contains_any(f"{link_text} {href}", PHONE_EXCLUDE_CONTEXT_KEYWORDS):
+                for match in PHONE_REGEX.finditer(tel_text):
+                    phone = normalize_phone(match.group(0))
+                    if phone:
+                        findings.append(ContactFinding(kind="phone", value=phone, reason="tel 링크에서 발견", source_url=source_url))
+    return findings
 
 
 def fetch_contact_page(url: str) -> tuple[str, str]:
@@ -1139,30 +1264,98 @@ def fetch_contact_page(url: str) -> tuple[str, str]:
         return "", "요청 실패"
 
 
-def collect_contact_info(site_url: object) -> tuple[str, str, list[dict[str, str]]]:
-    emails: list[str] = []
-    phones: list[str] = []
+def email_score(finding: ContactFinding) -> int:
+    local_part = finding.value.split("@", 1)[0].lower()
+    score = 0
+    if "mailto" in finding.reason.lower():
+        score += 5
+    if contains_any(finding.reason, ["footer", "고객센터", "문의", "회사소개"]):
+        score += 3
+    if local_part in {"contact", "cs", "help", "sales", "partner", "partnership", "info", "hello"}:
+        score += 2
+    return score
+
+
+def phone_score(finding: ContactFinding) -> int:
+    digits = re.sub(r"\D", "", finding.value)
+    score = 0
+    if "tel" in finding.reason.lower():
+        score += 5
+    if contains_any(finding.reason, ["footer", "고객센터", "문의", "회사소개"]):
+        score += 3
+    if digits.startswith(("15", "16", "18")) and len(digits) == 8:
+        score += 2
+    if digits.startswith(("02", "03", "04", "05", "06", "07")):
+        score += 1
+    return score
+
+
+def choose_best_finding(findings: list[ContactFinding], kind: str) -> ContactFinding | None:
+    typed_findings = [finding for finding in findings if finding.kind == kind]
+    deduped: dict[str, ContactFinding] = {}
+    for finding in typed_findings:
+        if finding.value not in deduped:
+            deduped[finding.value] = finding
+    typed_findings = list(deduped.values())
+    if not typed_findings:
+        return None
+
+    scorer = email_score if kind == "email" else phone_score
+    scored = sorted(((scorer(finding), finding) for finding in typed_findings), key=lambda item: item[0], reverse=True)
+    if len(scored) > 1 and scored[0][0] == scored[1][0] and scored[0][1].value != scored[1][1].value:
+        return None
+    return scored[0][1]
+
+
+def summarize_contact_findings(findings: list[ContactFinding]) -> dict[str, str]:
+    email_finding = choose_best_finding(findings, "email")
+    phone_finding = choose_best_finding(findings, "phone")
+    selected_findings = [finding for finding in [email_finding, phone_finding] if finding is not None]
+    source_urls = dedupe_keep_order([finding.source_url for finding in selected_findings])
+    reasons = dedupe_keep_order([finding.reason for finding in selected_findings])
+
+    if email_finding and phone_finding:
+        status = "수집완료"
+    elif email_finding:
+        status = "이메일만 수집"
+    elif phone_finding:
+        status = "전화번호만 수집"
+    else:
+        status = "연락처 없음"
+        reasons = ["실제 페이지에서 이메일/전화번호 미발견"]
+
+    return {
+        "이메일": email_finding.value if email_finding else "",
+        "전화번호": phone_finding.value if phone_finding else "",
+        "연락처 수집 상태": status,
+        "연락처 수집 사유": "; ".join(reasons[:2]),
+        "연락처 출처 URL": "; ".join(source_urls[:2]),
+    }
+
+
+def collect_contact_info(site_url: object) -> tuple[dict[str, str], list[dict[str, str]]]:
+    findings: list[ContactFinding] = []
     logs: list[dict[str, str]] = []
+
     for url in build_contact_urls(site_url):
         html, fetch_status = fetch_contact_page(url)
         log_row = {"확인URL": url, "결과": fetch_status, "이메일": "", "전화번호": ""}
         if not html:
             logs.append(log_row)
             continue
-        page_emails, page_phones = extract_contacts_from_html(html)
-        log_row["이메일"] = "; ".join(page_emails[:3])
-        log_row["전화번호"] = "; ".join(page_phones[:3])
-        log_row["결과"] = "연락처 발견" if page_emails or page_phones else "연락처 없음"
+        page_findings = extract_contacts_from_html(html, url)
+        page_summary = summarize_contact_findings(page_findings)
+        log_row["이메일"] = page_summary["이메일"]
+        log_row["전화번호"] = page_summary["전화번호"]
+        log_row["결과"] = "연락처 발견" if page_findings else "연락처 없음"
         logs.append(log_row)
-        emails.extend(page_emails)
-        phones.extend(page_phones)
-        emails = dedupe_keep_order(emails)
-        phones = dedupe_keep_order(phones)
-        if emails and phones:
+        findings.extend(page_findings)
+        summary = summarize_contact_findings(findings)
+        if summary["이메일"] and summary["전화번호"]:
             break
     if not logs:
         logs.append({"확인URL": clean_text(site_url), "결과": "유효한 사이트 URL 없음", "이메일": "", "전화번호": ""})
-    return "; ".join(emails[:3]), "; ".join(phones[:3]), logs
+    return summarize_contact_findings(findings), logs
 
 
 def collect_contacts_for_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, str]]]:
@@ -1178,12 +1371,18 @@ def collect_contacts_for_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list
         site = clean_text(output.at[frame_index, "사이트"]) if "사이트" in output else ""
         status.info(f"연락처 수집 중 ({position}/{total}): {brand or site} - {site}")
         try:
-            email, phone, logs = collect_contact_info(site)
+            contact_summary, logs = collect_contact_info(site)
         except Exception as exc:
-            email, phone = "", ""
+            contact_summary = {
+                "이메일": "",
+                "전화번호": "",
+                "연락처 수집 상태": "연락처 없음",
+                "연락처 수집 사유": f"처리 실패: {exc}",
+                "연락처 출처 URL": "",
+            }
             logs = [{"확인URL": site, "결과": f"처리 실패: {exc}", "이메일": "", "전화번호": ""}]
-        output.at[frame_index, "이메일"] = email
-        output.at[frame_index, "전화번호"] = phone
+        for column, value in contact_summary.items():
+            output.at[frame_index, column] = value
         for log in logs:
             all_logs.append(
                 {
@@ -1451,7 +1650,21 @@ def main() -> None:
 
     filtered, forbidden_excluded_count = apply_forbidden_filter(candidates, forbidden)
     if filtered.empty:
-        final_df = pd.DataFrame(columns=["상태", "업종", "브랜드명", "사이트", "이메일", "전화번호", "수집출처", "수집일"])
+        final_df = pd.DataFrame(
+            columns=[
+                "상태",
+                "업종",
+                "브랜드명",
+                "사이트",
+                "이메일",
+                "전화번호",
+                "연락처 수집 상태",
+                "연락처 수집 사유",
+                "연락처 출처 URL",
+                "수집출처",
+                "수집일",
+            ]
+        )
     else:
         final_df = prepare_output_dataframe(filtered)
 
@@ -1466,6 +1679,8 @@ def main() -> None:
                 final_df = add_ai_judgment_columns(final_df)
         except Exception as exc:
             st.warning(f"{exc} 기존 룰 기반 결과는 그대로 표시합니다.")
+
+    final_df = sanitize_contact_columns_for_display(final_df)
 
     usable_count = int((final_df["상태"] == "사용가능").sum()) if not final_df.empty else 0
     review_count = int((final_df["상태"] == "확인필요").sum()) if not final_df.empty else 0
