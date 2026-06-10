@@ -7,12 +7,14 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib import robotparser
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 from rapidfuzz import fuzz, process
 
 
@@ -22,6 +24,26 @@ SERPAPI_MAX_RETRIES = 2
 FUZZY_BRAND_THRESHOLD = 88
 AI_REQUEST_TIMEOUT = 30
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+CONTACT_REQUEST_TIMEOUT = 6
+CONTACT_USER_AGENT = "Mozilla/5.0 (compatible; SalesDBContactCollector/1.0)"
+CONTACT_PATHS = [
+    "",
+    "/contact",
+    "/contact-us",
+    "/company",
+    "/about",
+    "/customer",
+    "/cs",
+    "/help",
+    "/inquiry",
+    "/partnership",
+    "/business",
+    "/brand",
+]
+EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+PHONE_REGEX = re.compile(r"(?:\+?82[-.\s]?)?0\d{1,2}[-.\s)]?\d{3,4}[-.\s]?\d{4}|\b1[568]\d{2}[-.\s]?\d{4}\b")
+CONTACT_PRIORITY_KEYWORDS = ["footer", "회사소개", "고객센터", "제휴문의", "문의", "contact", "customer", "cs", "partnership", "inquiry"]
+ROBOTS_CACHE: dict[str, robotparser.RobotFileParser | None] = {}
 
 INDUSTRY_OPTIONS = [
     "뷰티",
@@ -1000,6 +1022,185 @@ def prepare_output_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return output.fillna("")
 
 
+def normalize_contact_url(url: object) -> str:
+    text = clean_text(url)
+    if not text:
+        return ""
+    parsed = urlparse(text if "://" in text else f"https://{text}")
+    if not parsed.netloc:
+        return ""
+    return f"{parsed.scheme or 'https'}://{parsed.netloc}"
+
+
+def build_contact_urls(site_url: object) -> list[str]:
+    base_url = normalize_contact_url(site_url)
+    if not base_url:
+        return []
+    return dedupe_keep_order([urljoin(base_url, path) for path in CONTACT_PATHS])
+
+
+def robots_allows(url: str) -> bool:
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    if robots_url in ROBOTS_CACHE:
+        parser = ROBOTS_CACHE[robots_url]
+        return True if parser is None else parser.can_fetch(CONTACT_USER_AGENT, url)
+    try:
+        response = requests.get(
+            robots_url,
+            timeout=CONTACT_REQUEST_TIMEOUT,
+            headers={"User-Agent": CONTACT_USER_AGENT},
+            allow_redirects=True,
+        )
+        if response.status_code >= 400:
+            ROBOTS_CACHE[robots_url] = None
+            return True
+        parser = robotparser.RobotFileParser()
+        parser.parse(response.text.splitlines())
+        ROBOTS_CACHE[robots_url] = parser
+        return parser.can_fetch(CONTACT_USER_AGENT, url)
+    except requests.RequestException:
+        ROBOTS_CACHE[robots_url] = None
+        return True
+
+
+def normalize_phone(value: str) -> str:
+    value = re.sub(r"[^\d+]", "", value)
+    if value.startswith("+82"):
+        value = "0" + value[3:]
+    if len(value) == 8 and value.startswith(("15", "16", "18")):
+        return f"{value[:4]}-{value[4:]}"
+    if len(value) == 10:
+        if value.startswith("02"):
+            return f"{value[:2]}-{value[2:6]}-{value[6:]}"
+        return f"{value[:3]}-{value[3:6]}-{value[6:]}"
+    if len(value) == 11:
+        return f"{value[:3]}-{value[3:7]}-{value[7:]}"
+    return value
+
+
+def visible_text_from_soup(soup: BeautifulSoup) -> str:
+    priority_chunks: list[str] = []
+    footer = soup.find("footer")
+    if footer:
+        priority_chunks.append(footer.get_text(" ", strip=True))
+    for element in soup.find_all(True):
+        element_id = " ".join(
+            [
+                clean_text(element.get("id", "")),
+                clean_text(" ".join(element.get("class", [])) if isinstance(element.get("class"), list) else element.get("class", "")),
+            ]
+        ).lower()
+        element_text = element.get_text(" ", strip=True)
+        if any(keyword.lower() in element_id or keyword.lower() in element_text.lower() for keyword in CONTACT_PRIORITY_KEYWORDS):
+            priority_chunks.append(element_text)
+    priority_text = " ".join(priority_chunks)
+    full_text = soup.get_text(" ", strip=True)
+    return f"{priority_text} {full_text}".strip()
+
+
+def extract_contacts_from_html(html: str) -> tuple[list[str], list[str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = [visible_text_from_soup(soup)]
+    for link in soup.find_all("a", href=True):
+        href = clean_text(link.get("href", ""))
+        if href.lower().startswith("mailto:"):
+            candidates.append(href.split(":", 1)[1].split("?", 1)[0])
+        elif href.lower().startswith("tel:"):
+            candidates.append(href.split(":", 1)[1])
+    text = " ".join(candidates)
+    emails = dedupe_keep_order([email for email in EMAIL_REGEX.findall(text) if not email.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"))])
+    phones = dedupe_keep_order([normalize_phone(phone) for phone in PHONE_REGEX.findall(text)])
+    return emails, phones
+
+
+def fetch_contact_page(url: str) -> tuple[str, str]:
+    if not robots_allows(url):
+        return "", "robots.txt 차단"
+    try:
+        response = requests.get(
+            url,
+            timeout=CONTACT_REQUEST_TIMEOUT,
+            headers={"User-Agent": CONTACT_USER_AGENT},
+            allow_redirects=True,
+        )
+        if response.status_code >= 400:
+            return "", f"HTTP {response.status_code}"
+        content_type = response.headers.get("Content-Type", "").lower()
+        if content_type and "text/html" not in content_type:
+            return "", "HTML 페이지 아님"
+        response.encoding = response.encoding or response.apparent_encoding or "utf-8"
+        return response.text, "접근 성공"
+    except requests.Timeout:
+        return "", "요청 시간 초과"
+    except requests.RequestException:
+        return "", "요청 실패"
+
+
+def collect_contact_info(site_url: object) -> tuple[str, str, list[dict[str, str]]]:
+    emails: list[str] = []
+    phones: list[str] = []
+    logs: list[dict[str, str]] = []
+    for url in build_contact_urls(site_url):
+        html, fetch_status = fetch_contact_page(url)
+        log_row = {"확인URL": url, "결과": fetch_status, "이메일": "", "전화번호": ""}
+        if not html:
+            logs.append(log_row)
+            continue
+        page_emails, page_phones = extract_contacts_from_html(html)
+        log_row["이메일"] = "; ".join(page_emails[:3])
+        log_row["전화번호"] = "; ".join(page_phones[:3])
+        log_row["결과"] = "연락처 발견" if page_emails or page_phones else "연락처 없음"
+        logs.append(log_row)
+        emails.extend(page_emails)
+        phones.extend(page_phones)
+        emails = dedupe_keep_order(emails)
+        phones = dedupe_keep_order(phones)
+        if emails and phones:
+            break
+    if not logs:
+        logs.append({"확인URL": clean_text(site_url), "결과": "유효한 사이트 URL 없음", "이메일": "", "전화번호": ""})
+    return "; ".join(emails[:3]), "; ".join(phones[:3]), logs
+
+
+def collect_contacts_for_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, str]]]:
+    output = df.copy()
+    if output.empty:
+        return output, []
+    progress = st.progress(0, text="연락처 수집을 준비하는 중입니다.")
+    status = st.empty()
+    all_logs: list[dict[str, str]] = []
+    total = len(output)
+    for position, frame_index in enumerate(output.index, start=1):
+        brand = clean_text(output.at[frame_index, "브랜드명"]) if "브랜드명" in output else ""
+        site = clean_text(output.at[frame_index, "사이트"]) if "사이트" in output else ""
+        status.info(f"연락처 수집 중 ({position}/{total}): {brand or site} - {site}")
+        try:
+            email, phone, logs = collect_contact_info(site)
+        except Exception as exc:
+            email, phone = "", ""
+            logs = [{"확인URL": site, "결과": f"처리 실패: {exc}", "이메일": "", "전화번호": ""}]
+        output.at[frame_index, "이메일"] = email
+        output.at[frame_index, "전화번호"] = phone
+        for log in logs:
+            all_logs.append(
+                {
+                    "브랜드명": brand,
+                    "사이트": site,
+                    "확인URL": clean_text(log.get("확인URL", "")),
+                    "결과": clean_text(log.get("결과", "")),
+                    "이메일": clean_text(log.get("이메일", "")),
+                    "전화번호": clean_text(log.get("전화번호", "")),
+                }
+            )
+        progress.progress(position / total, text=f"연락처 수집 중입니다. ({position}/{total})")
+    status.success("연락처 수집이 완료되었습니다.")
+    progress.empty()
+    return output, all_logs
+
+
 def extract_json_array(text: str) -> list[dict[str, object]]:
     text = clean_text(text)
     text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.IGNORECASE).strip()
@@ -1147,12 +1348,18 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def render_sidebar() -> tuple[str, bool]:
+def render_sidebar() -> tuple[str, bool, bool]:
     st.sidebar.header("연동 설정")
     sheet_url = st.sidebar.text_input(
         "영업금지 Google Sheet URL",
         placeholder="공개 CSV 또는 Google Sheet 공유 URL",
         help="실행 버튼을 눌렀을 때만 Google Sheet를 읽습니다.",
+    )
+    st.sidebar.header("연락처 수집")
+    collect_contacts = st.sidebar.checkbox(
+        "연락처 수집",
+        value=False,
+        help="체크한 경우 최종 결과 사이트의 주요 페이지에서 이메일과 전화번호를 순차 수집합니다.",
     )
     st.sidebar.header("AI 판단")
     use_ai_judgment = st.sidebar.checkbox(
@@ -1160,7 +1367,7 @@ def render_sidebar() -> tuple[str, bool]:
         value=False,
         help="체크한 경우 최종 룰 기반 결과에 AI 판단 컬럼만 추가합니다.",
     )
-    return sheet_url, use_ai_judgment
+    return sheet_url, collect_contacts, use_ai_judgment
 
 
 def render_forbidden_info(info: ForbiddenSheetInfo, encoding: str, row_count: int) -> None:
@@ -1189,11 +1396,19 @@ def render_quality_exclusions(stats: CollectionStats) -> None:
         st.dataframe(preview, width="stretch", hide_index=True)
 
 
+def render_contact_logs(logs: list[dict[str, str]]) -> None:
+    if not logs:
+        return
+    with st.expander("연락처 수집 접근 로그"):
+        st.caption("연락처 수집 옵션을 켰을 때만 표시됩니다. 실패한 사이트는 이메일/전화번호를 빈칸으로 유지합니다.")
+        st.dataframe(pd.DataFrame(logs).head(200), width="stretch", hide_index=True)
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📇", layout="wide")
     st.title(APP_TITLE)
 
-    sheet_url, use_ai_judgment = render_sidebar()
+    sheet_url, collect_contacts, use_ai_judgment = render_sidebar()
 
     with st.form("collection_form"):
         col1, col2 = st.columns([2, 1])
@@ -1240,6 +1455,11 @@ def main() -> None:
     else:
         final_df = prepare_output_dataframe(filtered)
 
+    contact_logs: list[dict[str, str]] = []
+    if collect_contacts and not final_df.empty:
+        with st.spinner("연락처를 수집하는 중입니다."):
+            final_df, contact_logs = collect_contacts_for_dataframe(final_df)
+
     if use_ai_judgment and not final_df.empty:
         try:
             with st.spinner("AI 판단을 추가하는 중입니다."):
@@ -1257,6 +1477,7 @@ def main() -> None:
     col4.metric("사용가능", usable_count)
     col5.metric("확인필요", review_count)
     render_quality_exclusions(stats)
+    render_contact_logs(contact_logs)
 
     st.subheader("결과 미리보기")
     st.dataframe(final_df, width="stretch", hide_index=True)
