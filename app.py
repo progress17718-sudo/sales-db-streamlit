@@ -1043,7 +1043,7 @@ def extract_openai_text(payload: dict[str, object]) -> str:
 def request_ai_judgments(records: list[dict[str, str]]) -> list[dict[str, object]]:
     api_key = get_config_value("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY가 환경변수 또는 Streamlit secrets에 설정되어 있지 않습니다.")
+        raise RuntimeError("OpenAI API 키가 설정되지 않았습니다")
 
     model = get_config_value("OPENAI_MODEL") or "gpt-4o-mini"
     prompt = (
@@ -1053,24 +1053,46 @@ def request_ai_judgments(records: list[dict[str, str]]) -> list[dict[str, object
         "ai_judgment 값은 공식몰 가능성 높음, 확인필요, 부적합 의심 중 하나만 사용하세요.\n"
         f"후보 목록: {records}"
     )
-    response = requests.post(
-        OPENAI_RESPONSES_URL,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "input": [
-                {
-                    "role": "system",
-                    "content": "너는 영업 DB 후보의 공식 사이트 적합성을 보수적으로 분류하는 검수자입니다.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0,
-        },
-        timeout=AI_REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    return extract_json_array(extract_openai_text(response.json()))
+    try:
+        response = requests.post(
+            OPENAI_RESPONSES_URL,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": "너는 영업 DB 후보의 공식 사이트 적합성을 보수적으로 분류하는 검수자입니다.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0,
+            },
+            timeout=AI_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+    except requests.Timeout as exc:
+        raise RuntimeError("AI 판단 요청 시간이 초과되었습니다") from exc
+    except requests.HTTPError as exc:
+        response = exc.response
+        status_code = response.status_code if response is not None else 0
+        response_text = response.text.lower() if response is not None else ""
+        quota_terms = ["quota", "billing", "credit", "insufficient_quota", "rate_limit", "exceeded"]
+        if status_code in {402, 429} or any(term in response_text for term in quota_terms):
+            raise RuntimeError("OpenAI API 사용 한도 또는 결제 설정을 확인해주세요") from exc
+        raise RuntimeError("AI 판단 요청에 실패했습니다") from exc
+    except requests.RequestException as exc:
+        raise RuntimeError("AI 판단 요청에 실패했습니다") from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("AI 응답 형식 처리에 실패했습니다") from exc
+
+    ai_rows = extract_json_array(extract_openai_text(payload))
+    if not ai_rows:
+        raise RuntimeError("AI 응답 형식 처리에 실패했습니다")
+    return ai_rows
 
 
 def add_ai_judgment_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -1091,8 +1113,6 @@ def add_ai_judgment_columns(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     ai_rows = request_ai_judgments(records)
-    if not ai_rows:
-        raise RuntimeError("AI 판단 응답을 처리하지 못했습니다.")
     judgments: dict[int, dict[str, str]] = {}
     for item in ai_rows:
         if not isinstance(item, dict):
@@ -1224,8 +1244,8 @@ def main() -> None:
         try:
             with st.spinner("AI 판단을 추가하는 중입니다."):
                 final_df = add_ai_judgment_columns(final_df)
-        except Exception:
-            st.warning("AI 판단을 완료하지 못해 기존 룰 기반 결과만 표시합니다.")
+        except Exception as exc:
+            st.warning(f"{exc} 기존 룰 기반 결과는 그대로 표시합니다.")
 
     usable_count = int((final_df["상태"] == "사용가능").sum()) if not final_df.empty else 0
     review_count = int((final_df["상태"] == "확인필요").sum()) if not final_df.empty else 0
